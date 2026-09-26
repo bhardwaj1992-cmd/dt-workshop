@@ -1,13 +1,20 @@
 #!/bin/bash
 # CodeDeploy AfterInstall hook - runs after the new application revision has
-# been copied to /opt/orderservice. Sets up the Python venv, resolves DB
+# been copied to /opt/orderservice/app. Sets up the Python venv, resolves DB
 # connection info from SSM Parameter Store, writes the runtime env file,
 # and installs/refreshes the systemd unit.
 set -euxo pipefail
 
 PROJECT_TAG="DT_Workshop"
 APP_DIR="/opt/orderservice"
-REGION="$(curl -s --max-time 3 http://169.254.169.254/latest/meta-data/placement/region || echo us-east-1)"
+
+# Region lookup via IMDSv2 (Amazon Linux 2023 requires a session token for
+# instance metadata). Fall back to us-east-1 if the token call fails.
+TOKEN="$(curl -s --max-time 3 -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)"
+REGION="$(curl -s --max-time 3 -H "X-aws-ec2-metadata-token: ${TOKEN}" \
+  http://169.254.169.254/latest/meta-data/placement/region || true)"
+REGION="${REGION:-us-east-1}"
 
 cd "$APP_DIR"
 

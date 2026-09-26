@@ -5,4 +5,6 @@ set -euxo pipefail
 
 dnf install -y python3 python3-pip
 
-mkdir -p /opt/orderservice
+# Clean any previous revision so redeploys start fresh.
+rm -rf /opt/orderservice/app /opt/orderservice/venv
+mkdir -p /opt/orderservice/app

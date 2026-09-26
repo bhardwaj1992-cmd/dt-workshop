@@ -1,0 +1,447 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DT_Workshop - App stack: ALB, EC2 Auto Scaling Group (baseline t3.micro),
+  RDS MySQL, CodeDeploy application, and supporting IAM roles / security groups.
+  Depends on outputs from the network stack.
+
+Parameters:
+  ProjectTag:
+    Type: String
+    Default: DT_Workshop
+  NetworkStackName:
+    Type: String
+    Description: Name of the already-deployed network stack (for cross-stack refs)
+    Default: dt-workshop-network
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Baseline EC2 instance type for the app tier
+  AsgMinSize:
+    Type: Number
+    Default: 2
+  AsgMaxSize:
+    Type: Number
+    Default: 2
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  DbName:
+    Type: String
+    Default: ordersdb
+  DbMasterUsername:
+    Type: String
+    Default: admin
+    Description: RDS MySQL master username
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      Leave as default. Resolves automatically to the latest Amazon Linux 2023
+      AMI for the region via SSM Parameter Store - no need to look up an AMI ID.
+
+Resources:
+
+  # --- DB master password, generated and stored in Secrets Manager ---
+  # Avoids typing/storing a plaintext password anywhere in the console or template.
+
+  DbMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectTag}-db-master-secret"
+      Description: DT_Workshop RDS MySQL master credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DbMasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 20
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: !Ref ProjectTag
+        - Key: auto-delete
+          Value: "no"
+
+  # --- Security groups ---
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DT_Workshop ALB security group - allows HTTP from internet
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Public HTTP access to the demo app
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectTag}-alb-sg"
+        - Key: auto-delete
+          Value: "no"
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DT_Workshop EC2 app tier security group - allows app port from ALB only
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: App traffic from the ALB only
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectTag}-app-sg"
+        - Key: auto-delete
+          Value: "no"
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DT_Workshop RDS security group - allows MySQL from app tier only
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: MySQL access from the app tier only
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectTag}-db-sg"
+        - Key: auto-delete
+          Value: "no"
+
+  # --- IAM role for EC2 instances (SSM, CodeDeploy, CloudWatch) ---
+
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectTag}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: CodeDeployAgentAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    s3:ExistingObjectTag/codedeploy: "true"
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                Resource:
+                  - !Sub "arn:aws:s3:::aws-codedeploy-${AWS::Region}/*"
+        - PolicyName: DbSecretReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DbMasterSecret
+        - PolicyName: DbParameterReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectTag}/db/*"
+      Tags:
+        - Key: Name
+          Value: !Ref ProjectTag
+        - Key: auto-delete
+          Value: "no"
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2InstanceRole
+
+  # --- CodeDeploy service role ---
+
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectTag}-codedeploy-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+      Tags:
+        - Key: Name
+          Value: !Ref ProjectTag
+        - Key: auto-delete
+          Value: "no"
+
+  # --- ALB ---
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: DT-Workshop-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - Fn::ImportValue: !Sub "${NetworkStackName}-PublicSubnet1Id"
+        - Fn::ImportValue: !Sub "${NetworkStackName}-PublicSubnet2Id"
+      Tags:
+        - Key: Name
+          Value: !Ref ProjectTag
+        - Key: auto-delete
+          Value: "no"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: DT-Workshop-tg
+      Port: 8080
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-VpcId"
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetType: instance
+      Tags:
+        - Key: Name
+          Value: !Ref ProjectTag
+        - Key: auto-delete
+          Value: "no"
+
+  ApplicationListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # --- Launch Template + Auto Scaling Group ---
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectTag}-lt"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt Ec2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Ref ProjectTag
+              - Key: auto-delete
+                Value: "no"
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Ref ProjectTag
+              - Key: auto-delete
+                Value: "no"
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -xe
+            dnf install -y ruby wget python3-pip amazon-cloudwatch-agent
+            cd /home/ec2-user
+            wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+            chmod +x ./install
+            ./install auto
+            systemctl enable codedeploy-agent
+            systemctl start codedeploy-agent
+            mkdir -p /opt/orderservice
+            echo "${ProjectTag}" > /opt/orderservice/deployed_marker.txt
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectTag}-asg"
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgMinSize
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnet1Id"
+        - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnet2Id"
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      Tags:
+        - Key: Name
+          Value: !Ref ProjectTag
+          PropagateAtLaunch: true
+        - Key: auto-delete
+          Value: "no"
+          PropagateAtLaunch: true
+
+  # --- RDS MySQL ---
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: DT_Workshop RDS subnet group
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnet1Id"
+        - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnet2Id"
+      Tags:
+        - Key: Name
+          Value: !Ref ProjectTag
+        - Key: auto-delete
+          Value: "no"
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: dt-workshop-mysql
+      Engine: mysql
+      EngineVersion: "8.0.45"
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp3
+      DBName: !Ref DbName
+      MasterUsername: !Ref DbMasterUsername
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbMasterSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroup
+      MultiAZ: false
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      Tags:
+        - Key: Name
+          Value: !Ref ProjectTag
+        - Key: auto-delete
+          Value: "no"
+
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbMasterSecret
+      TargetId: !Ref Database
+      TargetType: AWS::RDS::DBInstance
+
+  # --- SSM parameters so the app (via CodeDeploy scripts) can discover
+  # --- the DB endpoint and secret ARN by a stable, well-known path.
+
+  DbHostParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectTag}/db/host"
+      Type: String
+      Value: !GetAtt Database.Endpoint.Address
+      Tags:
+        Name: !Ref ProjectTag
+        auto-delete: "no"
+
+  DbNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectTag}/db/name"
+      Type: String
+      Value: !Ref DbName
+      Tags:
+        Name: !Ref ProjectTag
+        auto-delete: "no"
+
+  DbSecretArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectTag}/db/secret_arn"
+      Type: String
+      Value: !Ref DbMasterSecret
+      Tags:
+        Name: !Ref ProjectTag
+        auto-delete: "no"
+
+  # --- CodeDeploy application ---
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub "${ProjectTag}-orderservice"
+      ComputePlatform: Server
+      Tags:
+        - Key: Name
+          Value: !Ref ProjectTag
+        - Key: auto-delete
+          Value: "no"
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub "${ProjectTag}-orderservice-dg"
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      AutoScalingGroups:
+        - !Ref AppAutoScalingGroup
+      DeploymentStyle:
+        DeploymentType: IN_PLACE
+        DeploymentOption: WITHOUT_TRAFFIC_CONTROL
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      Tags:
+        - Key: Name
+          Value: !Ref ProjectTag
+        - Key: auto-delete
+          Value: "no"
+
+Outputs:
+  AlbDnsName:
+    Description: Public URL of the demo app
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+  DbEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  DbSecretArn:
+    Description: Secrets Manager ARN holding the RDS master username/password
+    Value: !Ref DbMasterSecret
+  CodeDeployApplicationName:
+    Value: !Ref CodeDeployApplication
+  CodeDeployDeploymentGroupName:
+    Value: !Ref CodeDeployDeploymentGroup
+  AutoScalingGroupName:
+    Value: !Ref AppAutoScalingGroup

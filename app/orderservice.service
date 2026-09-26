@@ -1,0 +1,15 @@
+[Unit]
+Description=DT_Workshop Order Service (gunicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/orderservice/app
+EnvironmentFile=/opt/orderservice/env.conf
+ExecStart=/opt/orderservice/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:8080 wsgi:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
